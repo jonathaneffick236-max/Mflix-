@@ -1,29 +1,53 @@
-const express=require('express');const cors=require('cors');const multer=require('multer');const path=require('path');const fs=require('fs');
-const app=express(),PORT=process.env.PORT||10000;
-const MUX_TOKEN_ID=process.env.MUX_TOKEN_ID,MUX_TOKEN_SECRET=process.env.MUX_TOKEN_SECRET,TMDB_API_KEY=process.env.TMDB_API_KEY;
-const ROOT=__dirname,PUBLIC=path.join(ROOT,'public'),POSTERS=path.join(ROOT,'uploads/posters'),DATA=path.join(ROOT,'data'),FILE=path.join(DATA,'movies.json');
-for(const d of [PUBLIC,POSTERS,DATA])fs.mkdirSync(d,{recursive:true});if(!fs.existsSync(FILE))fs.writeFileSync(FILE,'[]');
-app.use(cors());app.use(express.json({limit:'10mb'}));app.use(express.urlencoded({extended:true}));app.use(express.static(PUBLIC));app.use('/uploads',express.static(path.join(ROOT,'uploads')));
-const storage=multer.diskStorage({destination:(r,f,c)=>c(null,POSTERS),filename:(r,f,c)=>c(null,Date.now()+'-'+f.originalname.replace(/[^a-zA-Z0-9._-]/g,'-'))});
-const poster=multer({storage,limits:{fileSize:20*1024*1024},fileFilter:(r,f,c)=>f.mimetype.startsWith('image/')?c(null,true):c(new Error('Poster must be an image.'))});
-const read=()=>{try{const x=JSON.parse(fs.readFileSync(FILE,'utf8'));return Array.isArray(x)?x:[]}catch{return[]}};const write=x=>fs.writeFileSync(FILE,JSON.stringify(x,null,2));
-async function tmdb(ep){if(!TMDB_API_KEY)throw Error('TMDB_API_KEY is not configured on Render.');const r=await fetch('https://api.themoviedb.org/3'+ep,{headers:{Authorization:`Bearer ${TMDB_API_KEY}`,accept:'application/json'}});const d=await r.json();if(!r.ok)throw Error(d.status_message||`TMDB error ${r.status}`);return d}
-function muxAuth(){return'Basic '+Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')}
-async function mux(ep,opt={}){if(!MUX_TOKEN_ID||!MUX_TOKEN_SECRET)throw Error('Mux credentials are not configured on Render.');const r=await fetch('https://api.mux.com'+ep,{...opt,headers:{Authorization:muxAuth(),'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d?.error?.messages?.join(', ')||d?.error?.message||`Mux error ${r.status}`);return d}
-app.get('/api/health',(q,s)=>s.json({success:true,app:'MFLIX',status:'online',muxConfigured:!!(MUX_TOKEN_ID&&MUX_TOKEN_SECRET),tmdbConfigured:!!TMDB_API_KEY,downloadsEnabled:true}));
-app.get('/api/tmdb/search',async(q,s)=>{try{const title=String(q.query.q||'').trim(),year=String(q.query.year||'').trim();if(!title)return s.status(400).json({success:false,message:'Movie title is required.'});let ep=`/search/movie?query=${encodeURIComponent(title)}&language=en-US&include_adult=false&page=1`;if(year)ep+=`&year=${encodeURIComponent(year)}`;const d=await tmdb(ep);s.json({success:true,movies:(d.results||[]).slice(0,10).map(m=>({tmdbId:m.id,title:m.title,originalTitle:m.original_title,description:m.overview||'',releaseDate:m.release_date||null,releaseYear:m.release_date?+m.release_date.slice(0,4):null,posterPath:m.poster_path?`https://image.tmdb.org/t/p/w500${m.poster_path}`:null,backdropPath:m.backdrop_path?`https://image.tmdb.org/t/p/w1280${m.backdrop_path}`:null,voteAverage:m.vote_average}))})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/tmdb/movie/:id',async(q,s)=>{try{s.json({success:true,movie:await tmdb(`/movie/${encodeURIComponent(q.params.id)}?language=en-US`)})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/movies',(q,s)=>{const m=read().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));s.json({success:true,count:m.length,movies:m})});
-app.get('/api/movies/:id',(q,s)=>{const m=read().find(x=>String(x.id)===String(q.params.id));m?s.json({success:true,movie:m}):s.status(404).json({success:false,message:'Movie not found.'})});
-app.post('/api/movies/start',poster.single('poster'),async(q,s)=>{try{const {title,description,category,releaseYear,published,tmdbId}=q.body;if(!title?.trim())return s.status(400).json({success:false,message:'Movie title is required.'});let t=null;if(tmdbId)try{t=await tmdb(`/movie/${encodeURIComponent(tmdbId)}?language=en-US`)}catch{}if(!t)try{const x=await tmdb(`/search/movie?query=${encodeURIComponent(title.trim())}&language=en-US&include_adult=false&page=1`);if(x.results?.[0])t=await tmdb(`/movie/${x.results[0].id}?language=en-US`)}catch{}
-let finalTitle=t?.title||t?.original_title||title.trim(),finalDesc=t?.overview||description?.trim()||'',finalYear=t?.release_date?+t.release_date.slice(0,4):(releaseYear?+releaseYear:null),cat=category?.trim()||'Other',posterUrl=t?.poster_path?`https://image.tmdb.org/t/p/w500${t.poster_path}`:(q.file?`/uploads/posters/${q.file.filename}`:null);
-if(!category&&t?.genres?.[0])cat=t.genres[0].name;const md=await mux('/video/v1/uploads',{method:'POST',body:JSON.stringify({cors_origin:'*',new_asset_settings:{playback_policies:['public'],static_renditions:[{resolution:'highest'}]}})});const u=md.data;if(!u?.id||!u?.url)throw Error('Mux did not return a valid upload URL.');const movie={id:Date.now()+'-'+Math.round(Math.random()*1e6),title:finalTitle,description:finalDesc,category:cat,releaseYear:finalYear,published:published!=='false',tmdbId:t?.id||null,tmdbPoster:posterUrl,tmdbOverview:t?.overview||'',tmdbReleaseDate:t?.release_date||null,tmdbGenres:t?.genres||[],muxUploadId:u.id,muxAssetId:null,muxPlaybackId:null,playbackUrl:null,downloadUrl:null,downloadReady:false,status:'uploading',createdAt:new Date().toISOString()};const all=read();all.push(movie);write(all);s.status(201).json({success:true,movieId:movie.id,uploadId:u.id,uploadUrl:u.url,movie})}catch(e){console.error(e);s.status(500).json({success:false,message:e.message})}});
-async function refresh(movie){const ud=await mux(`/video/v1/uploads/${encodeURIComponent(movie.muxUploadId)}`);const u=ud.data;if(!u?.asset_id){movie.status='processing';return movie}const ad=await mux(`/video/v1/assets/${encodeURIComponent(u.asset_id)}`),a=ad.data;movie.muxAssetId=a.id;const p=a.playback_ids?.find(x=>x.policy==='public')?.id||movie.muxPlaybackId||null;movie.muxPlaybackId=p;movie.playbackUrl=p?`https://stream.mux.com/${p}.m3u8`:null;const rend=a.static_renditions?.files?.find(x=>x.ext==='mp4'&&x.status==='ready');if(rend&&p){movie.downloadReady=true;movie.downloadUrl=`https://stream.mux.com/${encodeURIComponent(p)}/${encodeURIComponent(rend.name)}?download=${encodeURIComponent(movie.title+'.mp4')}`;movie.staticRendition=rend}movie.status=a.status==='ready'?'ready':(u.status==='errored'?'errored':'processing');return movie}
-app.get('/api/mux/status/:uploadId',async(q,s)=>{try{const all=read(),m=all.find(x=>x.muxUploadId===q.params.uploadId);if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);write(all);s.json({success:true,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.post('/api/movies/:id/refresh-mux',async(q,s)=>{try{const all=read(),m=all.find(x=>String(x.id)===String(q.params.id));if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);write(all);s.json({success:true,ready:m.status==='ready',downloadReady:m.downloadReady,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.post('/api/movies/:id/enable-download',async(q,s)=>{try{const all=read(),m=all.find(x=>String(x.id)===String(q.params.id));if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);if(!m.downloadReady&&m.muxAssetId){try{await mux(`/video/v1/assets/${encodeURIComponent(m.muxAssetId)}/static-renditions`,{method:'POST',body:JSON.stringify({resolution:'highest'})})}catch(e){if(!/already|exist|conflict/i.test(e.message))console.warn(e.message)}}write(all);s.json({success:true,ready:m.downloadReady,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/search',(q,s)=>{const z=String(q.query.q||'').toLowerCase().trim();const m=read();s.json({success:true,movies:z?m.filter(x=>[x.title,x.description,x.category,x.releaseYear].join(' ').toLowerCase().includes(z)):m})});
-app.get('/api/categories',(q,s)=>s.json({success:true,categories:[...new Set(read().map(x=>x.category).filter(Boolean))]}));
-app.use((e,q,s,n)=>s.status(500).json({success:false,message:e.message||'Server error.'}));
-app.get(/.*/,(_,s)=>s.sendFile(path.join(PUBLIC,'index.html')));
-app.listen(PORT,()=>console.log(`MFLIX running on ${PORT}`));
+require("dotenv").config();
+const express=require("express");
+const cors=require("cors");
+const multer=require("multer");
+const fs=require("fs");
+const path=require("path");
+const crypto=require("crypto");
+
+const app=express();
+const PORT=process.env.PORT||10000;
+const DATA=path.join(__dirname,"data");
+const UPLOADS=path.join(__dirname,"uploads");
+fs.mkdirSync(DATA,{recursive:true}); fs.mkdirSync(UPLOADS,{recursive:true});
+const DB=path.join(DATA,"movies.json");
+if(!fs.existsSync(DB)) fs.writeFileSync(DB,"[]");
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static(__dirname));
+app.use("/uploads",express.static(UPLOADS));
+
+function read(){try{return JSON.parse(fs.readFileSync(DB,"utf8"))}catch{return []}}
+function write(x){fs.writeFileSync(DB,JSON.stringify(x,null,2))}
+function safe(s){return String(s||"").replace(/[^a-z0-9._-]/gi,"_")}
+const storage=multer.diskStorage({
+ destination:(req,file,cb)=>cb(null,UPLOADS),
+ filename:(req,file,cb)=>cb(null,Date.now()+"-"+crypto.randomBytes(4).toString("hex")+"-"+safe(file.originalname))
+});
+const upload=multer({storage,limits:{fileSize:5*1024*1024*1024}});
+
+app.get("/api/health",(req,res)=>res.json({ok:true,service:"MFLIX backend"}));
+app.get("/api/movies",(req,res)=>res.json(read()));
+
+app.post("/api/movies",upload.fields([{name:"poster",maxCount:1},{name:"video",maxCount:1}]),async(req,res)=>{
+ try{
+  if(!req.files?.poster?.[0] || !req.files?.video?.[0]) return res.status(400).json({error:"Poster and video are required"});
+  const movie={
+   id:crypto.randomUUID(),
+   title:req.body.title,
+   description:req.body.description||"",
+   category:req.body.category||"Entertainment",
+   year:req.body.year||"",
+   posterUrl:"/uploads/"+path.basename(req.files.poster[0].path),
+   videoUrl:"/uploads/"+path.basename(req.files.video[0].path),
+   playbackUrl:"/uploads/"+path.basename(req.files.video[0].path),
+   createdAt:new Date().toISOString()
+  };
+  const all=read(); all.unshift(movie); write(all); res.status(201).json(movie);
+ }catch(e){console.error(e);res.status(500).json({error:"Upload failed"})}
+});
+
+app.get("/",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
+app.listen(PORT,()=>console.log(`MFLIX running on port ${PORT}`));
