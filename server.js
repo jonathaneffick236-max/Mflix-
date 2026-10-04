@@ -1,29 +1,678 @@
-const express=require('express');const cors=require('cors');const multer=require('multer');const path=require('path');const fs=require('fs');
-const app=express(),PORT=process.env.PORT||10000;
-const MUX_TOKEN_ID=process.env.MUX_TOKEN_ID,MUX_TOKEN_SECRET=process.env.MUX_TOKEN_SECRET,TMDB_API_KEY=process.env.TMDB_API_KEY;
-const ROOT=__dirname,PUBLIC=path.join(ROOT,'public'),POSTERS=path.join(ROOT,'uploads/posters'),DATA=path.join(ROOT,'data'),FILE=path.join(DATA,'movies.json');
-for(const d of [PUBLIC,POSTERS,DATA])fs.mkdirSync(d,{recursive:true});if(!fs.existsSync(FILE))fs.writeFileSync(FILE,'[]');
-app.use(cors());app.use(express.json({limit:'10mb'}));app.use(express.urlencoded({extended:true}));app.use(express.static(PUBLIC));app.use('/uploads',express.static(path.join(ROOT,'uploads')));
-const storage=multer.diskStorage({destination:(r,f,c)=>c(null,POSTERS),filename:(r,f,c)=>c(null,Date.now()+'-'+f.originalname.replace(/[^a-zA-Z0-9._-]/g,'-'))});
-const poster=multer({storage,limits:{fileSize:20*1024*1024},fileFilter:(r,f,c)=>f.mimetype.startsWith('image/')?c(null,true):c(new Error('Poster must be an image.'))});
-const read=()=>{try{const x=JSON.parse(fs.readFileSync(FILE,'utf8'));return Array.isArray(x)?x:[]}catch{return[]}};const write=x=>fs.writeFileSync(FILE,JSON.stringify(x,null,2));
-async function tmdb(ep){if(!TMDB_API_KEY)throw Error('TMDB_API_KEY is not configured on Render.');const r=await fetch('https://api.themoviedb.org/3'+ep,{headers:{Authorization:`Bearer ${TMDB_API_KEY}`,accept:'application/json'}});const d=await r.json();if(!r.ok)throw Error(d.status_message||`TMDB error ${r.status}`);return d}
-function muxAuth(){return'Basic '+Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')}
-async function mux(ep,opt={}){if(!MUX_TOKEN_ID||!MUX_TOKEN_SECRET)throw Error('Mux credentials are not configured on Render.');const r=await fetch('https://api.mux.com'+ep,{...opt,headers:{Authorization:muxAuth(),'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d?.error?.messages?.join(', ')||d?.error?.message||`Mux error ${r.status}`);return d}
-app.get('/api/health',(q,s)=>s.json({success:true,app:'MFLIX',status:'online',muxConfigured:!!(MUX_TOKEN_ID&&MUX_TOKEN_SECRET),tmdbConfigured:!!TMDB_API_KEY,downloadsEnabled:true}));
-app.get('/api/tmdb/search',async(q,s)=>{try{const title=String(q.query.q||'').trim(),year=String(q.query.year||'').trim();if(!title)return s.status(400).json({success:false,message:'Movie title is required.'});let ep=`/search/movie?query=${encodeURIComponent(title)}&language=en-US&include_adult=false&page=1`;if(year)ep+=`&year=${encodeURIComponent(year)}`;const d=await tmdb(ep);s.json({success:true,movies:(d.results||[]).slice(0,10).map(m=>({tmdbId:m.id,title:m.title,originalTitle:m.original_title,description:m.overview||'',releaseDate:m.release_date||null,releaseYear:m.release_date?+m.release_date.slice(0,4):null,posterPath:m.poster_path?`https://image.tmdb.org/t/p/w500${m.poster_path}`:null,backdropPath:m.backdrop_path?`https://image.tmdb.org/t/p/w1280${m.backdrop_path}`:null,voteAverage:m.vote_average}))})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/tmdb/movie/:id',async(q,s)=>{try{s.json({success:true,movie:await tmdb(`/movie/${encodeURIComponent(q.params.id)}?language=en-US`)})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/movies',(q,s)=>{const m=read().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));s.json({success:true,count:m.length,movies:m})});
-app.get('/api/movies/:id',(q,s)=>{const m=read().find(x=>String(x.id)===String(q.params.id));m?s.json({success:true,movie:m}):s.status(404).json({success:false,message:'Movie not found.'})});
-app.post('/api/movies/start',poster.single('poster'),async(q,s)=>{try{const {title,description,category,releaseYear,published,tmdbId}=q.body;if(!title?.trim())return s.status(400).json({success:false,message:'Movie title is required.'});let t=null;if(tmdbId)try{t=await tmdb(`/movie/${encodeURIComponent(tmdbId)}?language=en-US`)}catch{}if(!t)try{const x=await tmdb(`/search/movie?query=${encodeURIComponent(title.trim())}&language=en-US&include_adult=false&page=1`);if(x.results?.[0])t=await tmdb(`/movie/${x.results[0].id}?language=en-US`)}catch{}
-let finalTitle=t?.title||t?.original_title||title.trim(),finalDesc=t?.overview||description?.trim()||'',finalYear=t?.release_date?+t.release_date.slice(0,4):(releaseYear?+releaseYear:null),cat=category?.trim()||'Other',posterUrl=t?.poster_path?`https://image.tmdb.org/t/p/w500${t.poster_path}`:(q.file?`/uploads/posters/${q.file.filename}`:null);
-if(!category&&t?.genres?.[0])cat=t.genres[0].name;const md=await mux('/video/v1/uploads',{method:'POST',body:JSON.stringify({cors_origin:'*',new_asset_settings:{playback_policies:['public'],static_renditions:[{resolution:'highest'}]}})});const u=md.data;if(!u?.id||!u?.url)throw Error('Mux did not return a valid upload URL.');const movie={id:Date.now()+'-'+Math.round(Math.random()*1e6),title:finalTitle,description:finalDesc,category:cat,releaseYear:finalYear,published:published!=='false',tmdbId:t?.id||null,tmdbPoster:posterUrl,tmdbOverview:t?.overview||'',tmdbReleaseDate:t?.release_date||null,tmdbGenres:t?.genres||[],muxUploadId:u.id,muxAssetId:null,muxPlaybackId:null,playbackUrl:null,downloadUrl:null,downloadReady:false,status:'uploading',createdAt:new Date().toISOString()};const all=read();all.push(movie);write(all);s.status(201).json({success:true,movieId:movie.id,uploadId:u.id,uploadUrl:u.url,movie})}catch(e){console.error(e);s.status(500).json({success:false,message:e.message})}});
-async function refresh(movie){const ud=await mux(`/video/v1/uploads/${encodeURIComponent(movie.muxUploadId)}`);const u=ud.data;if(!u?.asset_id){movie.status='processing';return movie}const ad=await mux(`/video/v1/assets/${encodeURIComponent(u.asset_id)}`),a=ad.data;movie.muxAssetId=a.id;const p=a.playback_ids?.find(x=>x.policy==='public')?.id||movie.muxPlaybackId||null;movie.muxPlaybackId=p;movie.playbackUrl=p?`https://stream.mux.com/${p}.m3u8`:null;const rend=a.static_renditions?.files?.find(x=>x.ext==='mp4'&&x.status==='ready');if(rend&&p){movie.downloadReady=true;movie.downloadUrl=`https://stream.mux.com/${encodeURIComponent(p)}/${encodeURIComponent(rend.name)}?download=${encodeURIComponent(movie.title+'.mp4')}`;movie.staticRendition=rend}movie.status=a.status==='ready'?'ready':(u.status==='errored'?'errored':'processing');return movie}
-app.get('/api/mux/status/:uploadId',async(q,s)=>{try{const all=read(),m=all.find(x=>x.muxUploadId===q.params.uploadId);if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);write(all);s.json({success:true,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.post('/api/movies/:id/refresh-mux',async(q,s)=>{try{const all=read(),m=all.find(x=>String(x.id)===String(q.params.id));if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);write(all);s.json({success:true,ready:m.status==='ready',downloadReady:m.downloadReady,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.post('/api/movies/:id/enable-download',async(q,s)=>{try{const all=read(),m=all.find(x=>String(x.id)===String(q.params.id));if(!m)return s.status(404).json({success:false,message:'Movie not found.'});await refresh(m);if(!m.downloadReady&&m.muxAssetId){try{await mux(`/video/v1/assets/${encodeURIComponent(m.muxAssetId)}/static-renditions`,{method:'POST',body:JSON.stringify({resolution:'highest'})})}catch(e){if(!/already|exist|conflict/i.test(e.message))console.warn(e.message)}}write(all);s.json({success:true,ready:m.downloadReady,movie:m})}catch(e){s.status(500).json({success:false,message:e.message})}});
-app.get('/api/search',(q,s)=>{const z=String(q.query.q||'').toLowerCase().trim();const m=read();s.json({success:true,movies:z?m.filter(x=>[x.title,x.description,x.category,x.releaseYear].join(' ').toLowerCase().includes(z)):m})});
-app.get('/api/categories',(q,s)=>s.json({success:true,categories:[...new Set(read().map(x=>x.category).filter(Boolean))]}));
-app.use((e,q,s,n)=>s.status(500).json({success:false,message:e.message||'Server error.'}));
-app.get(/.*/,(_,s)=>s.sendFile(path.join(PUBLIC,'index.html')));
-app.listen(PORT,()=>console.log(`MFLIX running on ${PORT}`));
+// ============================================================
+// MFLIX BACKEND
+// Render + Mux + TMDB
+// ============================================================
+
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+
+const app = express();
+
+const PORT = process.env.PORT || 10000;
+
+const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID;
+const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET;
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+
+// ------------------------------------------------------------
+// Middleware
+// ------------------------------------------------------------
+
+app.use(cors());
+
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/", (req, res) => {
+    res.json({
+        status: "online",
+        app: "MFLIX",
+        service: "Render + Mux + TMDB",
+        time: new Date().toISOString()
+    });
+});
+
+// ------------------------------------------------------------
+// Temporary movie storage
+// ------------------------------------------------------------
+// IMPORTANT:
+// This is suitable for testing only.
+// Render's local filesystem is not permanent.
+//
+// For production, connect this API to Render PostgreSQL
+// or another persistent database.
+// ------------------------------------------------------------
+
+const movies = [
+    {
+        id: "mflix-demo-1",
+        title: "MFLIX Demo Movie",
+        description:
+            "This is a demonstration movie used to test the MFLIX player.",
+        category: "Most Popular",
+        year: 2026,
+        poster:
+            "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=800&q=80",
+        rating: 8.2,
+        cast: [],
+        tmdbId: null,
+
+        // Your supplied Mux playback ID
+        muxPlaybackId:
+            "7hytGSu02qUMD7U7XdZaaXkeUSfj746ri46Ny1DqJiRk",
+
+        playbackId:
+            "7hytGSu02qUMD7U7XdZaaXkeUSfj746ri46Ny1DqJiRk",
+
+        status: "ready"
+    }
+];
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+
+function muxAuthHeader() {
+    if (!MUX_TOKEN_ID || !MUX_TOKEN_SECRET) {
+        throw new Error("MUX_TOKEN_ID or MUX_TOKEN_SECRET is missing");
+    }
+
+    const encoded = Buffer.from(
+        `${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`
+    ).toString("base64");
+
+    return `Basic ${encoded}`;
+}
+
+function createId() {
+    return crypto.randomUUID();
+}
+
+function cleanMovie(movie) {
+    return {
+        id: movie.id,
+        title: movie.title || "",
+        description: movie.description || "",
+        poster: movie.poster || "",
+        category: movie.category || "Most Popular",
+        year: movie.year || "",
+        rating: movie.rating || null,
+        cast: movie.cast || [],
+        tmdbId: movie.tmdbId || null,
+
+        muxPlaybackId:
+            movie.muxPlaybackId ||
+            movie.playbackId ||
+            null,
+
+        playbackId:
+            movie.playbackId ||
+            movie.muxPlaybackId ||
+            null,
+
+        status: movie.status || "ready",
+
+        downloadUrl: movie.downloadUrl || null
+    };
+}
+
+// ------------------------------------------------------------
+// MOVIES
+// ------------------------------------------------------------
+
+// Get all movies
+app.get("/api/movies", (req, res) => {
+    res.json(movies.map(cleanMovie));
+});
+
+// Get one movie
+app.get("/api/movies/:id", (req, res) => {
+    const movie = movies.find(
+        item => item.id === req.params.id
+    );
+
+    if (!movie) {
+        return res.status(404).json({
+            error: "Movie not found"
+        });
+    }
+
+    res.json(cleanMovie(movie));
+});
+
+// ------------------------------------------------------------
+// TMDB SEARCH
+// ------------------------------------------------------------
+
+app.get("/api/tmdb/search", async (req, res) => {
+    try {
+        if (!TMDB_API_KEY) {
+            return res.status(500).json({
+                error: "TMDB_API_KEY is not configured on Render"
+            });
+        }
+
+        const query = String(req.query.query || "").trim();
+
+        if (!query) {
+            return res.status(400).json({
+                error: "Missing query"
+            });
+        }
+
+        const url =
+            "https://api.themoviedb.org/3/search/multi" +
+            `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+            `&query=${encodeURIComponent(query)}` +
+            "&include_adult=false";
+
+        const response = await fetch(url);
+
+        if (!response.ok) {
+            const body = await response.text();
+
+            return res.status(response.status).json({
+                error: "TMDB request failed",
+                details: body
+            });
+        }
+
+        const data = await response.json();
+
+        const results = (data.results || [])
+            .filter(item =>
+                item.media_type === "movie" ||
+                item.media_type === "tv"
+            )
+            .map(item => ({
+                id: item.id,
+                mediaType: item.media_type,
+                title:
+                    item.title ||
+                    item.name ||
+                    "",
+                description:
+                    item.overview ||
+                    "",
+                releaseDate:
+                    item.release_date ||
+                    item.first_air_date ||
+                    "",
+                year:
+                    (
+                        item.release_date ||
+                        item.first_air_date ||
+                        ""
+                    ).slice(0, 4),
+                rating:
+                    item.vote_average || 0,
+                poster:
+                    item.poster_path
+                        ? `https://image.tmdb.org/t/p/w780${item.poster_path}`
+                        : "",
+                backdrop:
+                    item.backdrop_path
+                        ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}`
+                        : ""
+            }));
+
+        res.json({
+            results
+        });
+
+    } catch (error) {
+        console.error("TMDB search error:", error);
+
+        res.status(500).json({
+            error: "TMDB search failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// TMDB MOVIE DETAILS
+// ------------------------------------------------------------
+
+app.get("/api/tmdb/movie/:id", async (req, res) => {
+    try {
+        if (!TMDB_API_KEY) {
+            return res.status(500).json({
+                error: "TMDB_API_KEY is not configured"
+            });
+        }
+
+        const tmdbId = encodeURIComponent(req.params.id);
+
+        const url =
+            `https://api.themoviedb.org/3/movie/${tmdbId}` +
+            `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+            "&append_to_response=credits";
+
+        const response = await fetch(url);
+
+        if (!response.ok) {
+            const body = await response.text();
+
+            return res.status(response.status).json({
+                error: "TMDB movie request failed",
+                details: body
+            });
+        }
+
+        const data = await response.json();
+
+        const cast = (data.credits?.cast || [])
+            .slice(0, 12)
+            .map(person => ({
+                id: person.id,
+                name: person.name,
+                character: person.character,
+                profile:
+                    person.profile_path
+                        ? `https://image.tmdb.org/t/p/w300${person.profile_path}`
+                        : ""
+            }));
+
+        res.json({
+            id: data.id,
+            title: data.title,
+            description: data.overview || "",
+            releaseDate: data.release_date || "",
+            year:
+                (data.release_date || "").slice(0, 4),
+            rating: data.vote_average || 0,
+            poster:
+                data.poster_path
+                    ? `https://image.tmdb.org/t/p/w780${data.poster_path}`
+                    : "",
+            backdrop:
+                data.backdrop_path
+                    ? `https://image.tmdb.org/t/p/w1280${data.backdrop_path}`
+                    : "",
+            genres: (data.genres || []).map(
+                genre => genre.name
+            ),
+            cast
+        });
+
+    } catch (error) {
+        console.error("TMDB details error:", error);
+
+        res.status(500).json({
+            error: "TMDB details request failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// MUX DIRECT UPLOAD
+// ------------------------------------------------------------
+// The browser requests an upload URL from Render.
+// The actual large video file can then be uploaded directly
+// to Mux instead of passing through Render.
+//
+// This is the recommended architecture.
+// ------------------------------------------------------------
+
+app.post("/api/mux/direct-upload", async (req, res) => {
+    try {
+        if (!MUX_TOKEN_ID || !MUX_TOKEN_SECRET) {
+            return res.status(500).json({
+                error:
+                    "Mux credentials are not configured on Render"
+            });
+        }
+
+        const response = await fetch(
+            "https://api.mux.com/video/v1/uploads",
+            {
+                method: "POST",
+
+                headers: {
+                    Authorization: muxAuthHeader(),
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify({
+                    new_asset_settings: {
+                        playback_policy: ["public"],
+                        video_quality: "basic"
+                    },
+
+                    cors_origin: "*"
+                })
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            console.error("Mux upload creation failed:", data);
+
+            return res.status(response.status).json({
+                error: "Unable to create Mux upload",
+                details: data
+            });
+        }
+
+        res.json({
+            uploadId: data.data.id,
+            uploadUrl: data.data.url,
+            status: data.data.status
+        });
+
+    } catch (error) {
+        console.error("Mux direct upload error:", error);
+
+        res.status(500).json({
+            error: "Mux direct upload failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// CHECK MUX UPLOAD
+// ------------------------------------------------------------
+
+app.get("/api/mux/upload/:uploadId", async (req, res) => {
+    try {
+        const uploadId =
+            encodeURIComponent(req.params.uploadId);
+
+        const response = await fetch(
+            `https://api.mux.com/video/v1/uploads/${uploadId}`,
+            {
+                headers: {
+                    Authorization: muxAuthHeader()
+                }
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            return res.status(response.status).json({
+                error: "Unable to check Mux upload",
+                details: data
+            });
+        }
+
+        res.json(data);
+
+    } catch (error) {
+        console.error("Mux upload status error:", error);
+
+        res.status(500).json({
+            error: "Mux upload status check failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// MUX ASSET
+// ------------------------------------------------------------
+
+app.get("/api/mux/asset/:assetId", async (req, res) => {
+    try {
+        const assetId =
+            encodeURIComponent(req.params.assetId);
+
+        const response = await fetch(
+            `https://api.mux.com/video/v1/assets/${assetId}`,
+            {
+                headers: {
+                    Authorization: muxAuthHeader()
+                }
+            }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            return res.status(response.status).json({
+                error: "Unable to retrieve Mux asset",
+                details: data
+            });
+        }
+
+        res.json(data);
+
+    } catch (error) {
+        console.error("Mux asset error:", error);
+
+        res.status(500).json({
+            error: "Mux asset request failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// CREATE MOVIE RECORD
+// ------------------------------------------------------------
+// Called after the Mux upload has finished.
+//
+// Expected JSON:
+// {
+//   title,
+//   description,
+//   category,
+//   year,
+//   poster,
+//   tmdbId,
+//   muxPlaybackId
+// }
+// ------------------------------------------------------------
+
+app.post("/api/movies", async (req, res) => {
+    try {
+        const {
+            title,
+            description,
+            category,
+            year,
+            poster,
+            tmdbId,
+            muxPlaybackId,
+            rating,
+            cast
+        } = req.body;
+
+        if (!title) {
+            return res.status(400).json({
+                error: "Movie title is required"
+            });
+        }
+
+        if (!muxPlaybackId) {
+            return res.status(400).json({
+                error: "Mux playback ID is required"
+            });
+        }
+
+        const movie = {
+            id: createId(),
+
+            title: String(title).trim(),
+
+            description:
+                String(description || "").trim(),
+
+            category:
+                String(category || "Most Popular"),
+
+            year:
+                year || "",
+
+            poster:
+                poster || "",
+
+            tmdbId:
+                tmdbId || null,
+
+            rating:
+                rating || null,
+
+            cast:
+                Array.isArray(cast)
+                    ? cast
+                    : [],
+
+            muxPlaybackId:
+                String(muxPlaybackId),
+
+            playbackId:
+                String(muxPlaybackId),
+
+            status: "ready",
+
+            createdAt:
+                new Date().toISOString()
+        };
+
+        movies.unshift(movie);
+
+        res.status(201).json({
+            success: true,
+            movie: cleanMovie(movie)
+        });
+
+    } catch (error) {
+        console.error("Create movie error:", error);
+
+        res.status(500).json({
+            error: "Unable to create movie"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// CURRENT FRONTEND UPLOAD COMPATIBILITY ROUTE
+// ------------------------------------------------------------
+// This route intentionally does NOT pretend to process a
+// large video file through Render.
+//
+// The frontend should use:
+// POST /api/mux/direct-upload
+//
+// then:
+// POST /api/movies
+//
+// instead.
+// ------------------------------------------------------------
+
+app.post("/api/movies/upload", async (req, res) => {
+    res.status(400).json({
+        error:
+            "Use the Mux direct-upload flow. Request /api/mux/direct-upload first, upload the video directly to Mux, then create the movie with POST /api/movies."
+    });
+});
+
+// ------------------------------------------------------------
+// DOWNLOAD
+// ------------------------------------------------------------
+// IMPORTANT:
+// A Mux playback ID is NOT automatically a downloadable MP4.
+//
+// This endpoint only returns a configured download URL.
+// A production implementation should generate an authorized
+// Mux download URL according to the Mux account/asset setup.
+// ------------------------------------------------------------
+
+app.get("/api/movies/:id/download", async (req, res) => {
+    try {
+        const movie = movies.find(
+            item => item.id === req.params.id
+        );
+
+        if (!movie) {
+            return res.status(404).json({
+                error: "Movie not found"
+            });
+        }
+
+        if (!movie.downloadUrl) {
+            return res.status(404).json({
+                error:
+                    "Download is not configured for this movie"
+            });
+        }
+
+        res.json({
+            downloadUrl: movie.downloadUrl
+        });
+
+    } catch (error) {
+        console.error("Download error:", error);
+
+        res.status(500).json({
+            error: "Download request failed"
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// HEALTH CHECK
+// ------------------------------------------------------------
+
+app.get("/api/health", (req, res) => {
+    res.json({
+        status: "ok",
+        mflix: true,
+        muxConfigured:
+            Boolean(
+                MUX_TOKEN_ID &&
+                MUX_TOKEN_SECRET
+            ),
+        tmdbConfigured:
+            Boolean(TMDB_API_KEY),
+        movies:
+            movies.length
+    });
+});
+
+// ------------------------------------------------------------
+// 404
+// ------------------------------------------------------------
+
+app.use((req, res) => {
+    res.status(404).json({
+        error: "MFLIX API route not found"
+    });
+});
+
+// ------------------------------------------------------------
+// ERROR HANDLER
+// ------------------------------------------------------------
+
+app.use((err, req, res, next) => {
+    console.error("Unhandled error:", err);
+
+    res.status(500).json({
+        error: "Internal MFLIX server error"
+    });
+});
+
+// ------------------------------------------------------------
+// START SERVER
+// ------------------------------------------------------------
+
+app.listen(PORT, () => {
+    console.log(
+        `MFLIX backend running on port ${PORT}`
+    );
+
+    console.log(
+        `Mux configured: ${Boolean(
+            MUX_TOKEN_ID &&
+            MUX_TOKEN_SECRET
+        )}`
+    );
+
+    console.log(
+        `TMDB configured: ${Boolean(
+            TMDB_API_KEY
+        )}`
+    );
+});
