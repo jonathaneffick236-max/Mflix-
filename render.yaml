@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: app
     name: mflix-backend
     runtime: node
     buildCommand: npm install
